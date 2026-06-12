@@ -3,6 +3,7 @@ from typing import Annotated
 from fastapi import Depends
 
 from src.api.schemas.agent_analytics import AgentAnalyticsSummary, TaskStatusCounts
+from src.domain.repositories.agent_repository import DAgentRepository
 from src.domain.repositories.task_repository import DTaskRepository
 from src.utils.logging import make_logger
 
@@ -12,10 +13,16 @@ HOURS_IN_DAY = 24.0
 
 
 class AgentAnalyticsUseCase:
-    def __init__(self, task_repository: DTaskRepository):
+    def __init__(
+        self,
+        task_repository: DTaskRepository,
+        agent_repository: DAgentRepository,
+    ):
         self.task_repo = task_repository
+        self.agent_repo = agent_repository
 
     async def get_summary(self, agent_id: str) -> AgentAnalyticsSummary:
+        await self.agent_repo.get(id=agent_id)
         analytics = await self.task_repo.get_analytics_for_agent(agent_id)
 
         counts = analytics.status_counts
