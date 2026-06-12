@@ -56,6 +56,34 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /agents/{agent_id}/analytics:
+    get:
+      tags:
+      - Agents
+      summary: Get Agent Analytics Summary
+      description: 'Returns task analytics for an agent: status counts, average duration,
+        throughput, and error rate.'
+      operationId: get_agent_analytics_agents__agent_id__analytics_get
+      parameters:
+      - name: agent_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Agent Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentAnalyticsSummary'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /agents/name/{agent_name}:
     get:
       tags:
@@ -3834,6 +3862,52 @@ components:
       - github
       - slack
       title: AgentAPIKeyType
+    AgentAnalyticsSummary:
+      properties:
+        agent_id:
+          type: string
+          title: Agent Id
+          description: The agent ID these analytics are for
+        total_tasks:
+          type: integer
+          title: Total Tasks
+          description: Total number of non-deleted tasks
+          default: 0
+        task_status_counts:
+          $ref: '#/components/schemas/TaskStatusCounts'
+          description: Task counts broken down by status
+        avg_task_duration_seconds:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Avg Task Duration Seconds
+          description: Average duration in seconds for completed tasks (null if no
+            completed tasks)
+        tasks_completed_last_24h:
+          type: integer
+          title: Tasks Completed Last 24H
+          description: Number of tasks completed in the last 24 hours
+          default: 0
+        tasks_failed_last_24h:
+          type: integer
+          title: Tasks Failed Last 24H
+          description: Number of tasks that failed in the last 24 hours
+          default: 0
+        throughput_per_hour:
+          type: number
+          title: Throughput Per Hour
+          description: Tasks completed per hour over the last 24 hours
+          default: 0.0
+        error_rate:
+          type: number
+          title: Error Rate
+          description: Ratio of failed tasks to total tasks in the last 24 hours (0.0
+            - 1.0)
+          default: 0.0
+      type: object
+      required:
+      - agent_id
+      title: AgentAnalyticsSummary
     AgentInputType:
       type: string
       enum:
@@ -6202,6 +6276,40 @@ components:
       - TIMED_OUT
       - DELETED
       title: TaskStatus
+    TaskStatusCounts:
+      properties:
+        running:
+          type: integer
+          title: Running
+          description: Number of tasks currently running
+          default: 0
+        completed:
+          type: integer
+          title: Completed
+          description: Number of completed tasks
+          default: 0
+        failed:
+          type: integer
+          title: Failed
+          description: Number of failed tasks
+          default: 0
+        canceled:
+          type: integer
+          title: Canceled
+          description: Number of canceled tasks
+          default: 0
+        terminated:
+          type: integer
+          title: Terminated
+          description: Number of terminated tasks
+          default: 0
+        timed_out:
+          type: integer
+          title: Timed Out
+          description: Number of timed-out tasks
+          default: 0
+      type: object
+      title: TaskStatusCounts
     TaskStatusReasonRequest:
       properties:
         reason:

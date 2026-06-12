@@ -6,6 +6,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from src.adapters.crud_store.exceptions import ItemDoesNotExist
+from src.api.schemas.agent_analytics import AgentAnalyticsSummary
 from src.api.schemas.agents import (
     Agent,
     RegisterAgentRequest,
@@ -34,6 +35,7 @@ from src.domain.services.authorization_service import (
     DAuthorizationService,
 )
 from src.domain.services.task_service import DAgentTaskService
+from src.domain.use_cases.agent_analytics_use_case import DAgentAnalyticsUseCase
 from src.domain.use_cases.agent_api_keys_use_case import DAgentAPIKeysUseCase
 from src.domain.use_cases.agents_acp_use_case import DAgentsACPUseCase
 from src.domain.use_cases.agents_use_case import DAgentsUseCase
@@ -85,6 +87,19 @@ async def get_agent_by_id(
     """Get an agent by its unique ID."""
     agent_entity = await agents_use_case.get(id=agent_id)
     return Agent.model_validate(agent_entity)
+
+
+@router.get(
+    "/{agent_id}/analytics",
+    response_model=AgentAnalyticsSummary,
+    summary="Get Agent Analytics Summary",
+    description="Returns task analytics for an agent: status counts, average duration, throughput, and error rate.",
+)
+async def get_agent_analytics(
+    agent_id: DAuthorizedId(AgentexResourceType.agent, AuthorizedOperationType.read),  # type: ignore
+    analytics_use_case: DAgentAnalyticsUseCase,
+):
+    return await analytics_use_case.get_summary(agent_id=agent_id)
 
 
 @router.get(
