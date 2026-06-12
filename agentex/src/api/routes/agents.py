@@ -6,6 +6,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from src.adapters.crud_store.exceptions import ItemDoesNotExist
+from src.api.schemas.agent_analytics import AgentAnalyticsResponse
 from src.api.schemas.agents import (
     Agent,
     RegisterAgentRequest,
@@ -34,6 +35,7 @@ from src.domain.services.authorization_service import (
     DAuthorizationService,
 )
 from src.domain.services.task_service import DAgentTaskService
+from src.domain.use_cases.agent_analytics_use_case import DAgentAnalyticsUseCase
 from src.domain.use_cases.agent_api_keys_use_case import DAgentAPIKeysUseCase
 from src.domain.use_cases.agents_acp_use_case import DAgentsACPUseCase
 from src.domain.use_cases.agents_use_case import DAgentsUseCase
@@ -173,6 +175,20 @@ async def delete_agent_by_name(
     return DeleteResponse(
         id=agent_entity.id, message=f"Agent '{agent_name}' deleted successfully"
     )
+
+
+@router.get(
+    "/{agent_id}/analytics",
+    response_model=AgentAnalyticsResponse,
+    summary="Get Agent Analytics",
+    description="Get task analytics summary for an agent (status counts, avg duration, throughput, error rate).",
+)
+async def get_agent_analytics(
+    agent_id: DAuthorizedId(AgentexResourceType.agent, AuthorizedOperationType.read),  # type: ignore
+    analytics_use_case: DAgentAnalyticsUseCase,
+) -> AgentAnalyticsResponse:
+    """Get analytics summary for a given agent's tasks."""
+    return await analytics_use_case.get_agent_analytics(agent_id=agent_id)
 
 
 @router.post(
