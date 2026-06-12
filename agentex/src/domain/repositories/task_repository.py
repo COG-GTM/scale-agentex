@@ -296,7 +296,7 @@ class TaskRepository(PostgresCRUDRepository[TaskORM, TaskEntity, TaskRelationshi
             .where(
                 TaskAgentORM.agent_id == agent_id,
                 TaskORM.status != TaskStatus.DELETED,
-                TaskORM.created_at >= cutoff_24h,
+                TaskORM.updated_at >= cutoff_24h,
             )
             .group_by(TaskORM.status)
         )
