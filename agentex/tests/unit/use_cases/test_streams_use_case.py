@@ -225,11 +225,14 @@ class TestStreamTaskEvents:
         mock_stream_repository.read_messages.side_effect = _gen_cancel
 
         gen = streams_use_case.stream_task_events(task_id="task-42")
-        first = await gen.__anext__()
+        try:
+            first = await gen.__anext__()
 
-        assert "data:" in first
-        assert '"connected"' in first
-        assert '"task-42"' in first
+            assert "data:" in first
+            assert '"connected"' in first
+            assert '"task-42"' in first
+        finally:
+            await gen.aclose()
 
     async def test_yields_message_data_then_stops(
         self, streams_use_case, mock_stream_repository
