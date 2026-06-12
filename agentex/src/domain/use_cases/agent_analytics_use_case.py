@@ -1,4 +1,3 @@
-from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import Depends
@@ -15,67 +14,28 @@ class AgentAnalyticsUseCase:
         self.task_repo = task_repository
 
     async def get_agent_analytics(self, agent_id: str) -> AgentAnalyticsResponse:
-        """Compute analytics summary for a given agent's tasks."""
-        all_tasks = await self.task_repo.list_with_join(
-            agent_id=agent_id,
-            order_by="created_at",
-            order_direction="desc",
-        )
+        """Compute analytics summary for a given agent's tasks via SQL aggregation."""
+        data = await self.task_repo.get_analytics_for_agent(agent_id=agent_id)
 
-        now = datetime.now(UTC)
-        cutoff_24h = now - timedelta(hours=24)
-
-        running = 0
-        completed = 0
-        failed = 0
-        canceled = 0
-        completed_durations: list[float] = []
-        completed_last_24h = 0
-        failed_last_24h = 0
-        total_last_24h = 0
-
-        for task in all_tasks:
-            status = task.status.value if task.status else None
-
-            if status == "RUNNING":
-                running += 1
-            elif status == "COMPLETED":
-                completed += 1
-                if task.created_at and task.updated_at:
-                    duration = (task.updated_at - task.created_at).total_seconds()
-                    if duration >= 0:
-                        completed_durations.append(duration)
-            elif status == "FAILED":
-                failed += 1
-            elif status == "CANCELED":
-                canceled += 1
-
-            if task.created_at and task.created_at >= cutoff_24h:
-                total_last_24h += 1
-                if status == "COMPLETED":
-                    completed_last_24h += 1
-                elif status == "FAILED":
-                    failed_last_24h += 1
-
-        avg_duration = (
-            sum(completed_durations) / len(completed_durations)
-            if completed_durations
-            else None
-        )
+        status_counts = data["status_counts"]
+        total_last_24h = data["total_last_24h"]
+        failed_last_24h = data["failed_last_24h"]
 
         error_rate = failed_last_24h / total_last_24h if total_last_24h > 0 else None
 
         return AgentAnalyticsResponse(
             agent_id=agent_id,
-            total_tasks=len(all_tasks),
+            total_tasks=data["total"],
             tasks_by_status=TaskStatusCounts(
-                running=running,
-                completed=completed,
-                failed=failed,
-                canceled=canceled,
+                running=status_counts.get("RUNNING", 0),
+                completed=status_counts.get("COMPLETED", 0),
+                failed=status_counts.get("FAILED", 0),
+                canceled=status_counts.get("CANCELED", 0),
+                terminated=status_counts.get("TERMINATED", 0),
+                timed_out=status_counts.get("TIMED_OUT", 0),
             ),
-            avg_task_duration_seconds=avg_duration,
-            throughput_last_24h=completed_last_24h,
+            avg_task_duration_seconds=data["avg_duration_seconds"],
+            throughput_last_24h=data["completed_last_24h"],
             error_rate_last_24h=error_rate,
         )
 

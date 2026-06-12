@@ -6290,6 +6290,16 @@ components:
           title: Canceled
           description: Number of canceled tasks
           default: 0
+        terminated:
+          type: integer
+          title: Terminated
+          description: Number of terminated tasks
+          default: 0
+        timed_out:
+          type: integer
+          title: Timed Out
+          description: Number of timed-out tasks
+          default: 0
       type: object
       title: TaskStatusCounts
     TaskStatusReasonRequest:

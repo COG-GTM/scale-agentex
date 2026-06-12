@@ -8,6 +8,8 @@ class TaskStatusCounts(BaseModel):
     completed: int = Field(0, description="Number of completed tasks")
     failed: int = Field(0, description="Number of failed tasks")
     canceled: int = Field(0, description="Number of canceled tasks")
+    terminated: int = Field(0, description="Number of terminated tasks")
+    timed_out: int = Field(0, description="Number of timed-out tasks")
 
 
 class AgentAnalyticsResponse(BaseModel):

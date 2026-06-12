@@ -247,5 +247,97 @@ class TaskRepository(PostgresCRUDRepository[TaskORM, TaskEntity, TaskRelationshi
                 return None
             return TaskEntity.model_validate(refreshed)
 
+    async def get_analytics_for_agent(
+        self,
+        agent_id: str,
+    ) -> dict:
+        """Return aggregated analytics for an agent's tasks via SQL.
+
+        Returns a dict with:
+          - status_counts: {status_value: count}
+          - avg_duration_seconds: float | None (completed tasks only)
+          - completed_last_24h: int
+          - failed_last_24h: int
+          - total_last_24h: int
+          - total: int
+        """
+        cutoff_24h = datetime.now(UTC) - timedelta(hours=24)
+
+        # Status counts for all tasks belonging to this agent
+        status_query = (
+            select(TaskORM.status, func.count())
+            .join(TaskAgentORM, TaskORM.id == TaskAgentORM.task_id)
+            .where(
+                TaskAgentORM.agent_id == agent_id,
+                TaskORM.status != TaskStatus.DELETED,
+            )
+            .group_by(TaskORM.status)
+        )
+
+        # Average duration for completed tasks (updated_at - created_at)
+        avg_duration_query = (
+            select(
+                func.avg(
+                    func.extract("epoch", TaskORM.updated_at)
+                    - func.extract("epoch", TaskORM.created_at)
+                )
+            )
+            .join(TaskAgentORM, TaskORM.id == TaskAgentORM.task_id)
+            .where(
+                TaskAgentORM.agent_id == agent_id,
+                TaskORM.status == TaskStatus.COMPLETED,
+            )
+        )
+
+        # 24h window counts
+        recent_query = (
+            select(TaskORM.status, func.count())
+            .join(TaskAgentORM, TaskORM.id == TaskAgentORM.task_id)
+            .where(
+                TaskAgentORM.agent_id == agent_id,
+                TaskORM.status != TaskStatus.DELETED,
+                TaskORM.created_at >= cutoff_24h,
+            )
+            .group_by(TaskORM.status)
+        )
+
+        async with self.start_async_db_session(allow_writes=False) as session:
+            status_result = await session.execute(status_query)
+            status_rows = status_result.all()
+
+            avg_result = await session.execute(avg_duration_query)
+            avg_duration = avg_result.scalar()
+
+            recent_result = await session.execute(recent_query)
+            recent_rows = recent_result.all()
+
+        status_counts: dict[str, int] = {}
+        total = 0
+        for status_val, count in status_rows:
+            key = status_val.value if status_val else "UNKNOWN"
+            status_counts[key] = count
+            total += count
+
+        completed_last_24h = 0
+        failed_last_24h = 0
+        total_last_24h = 0
+        for status_val, count in recent_rows:
+            total_last_24h += count
+            if status_val == TaskStatus.COMPLETED:
+                completed_last_24h = count
+            elif status_val == TaskStatus.FAILED:
+                failed_last_24h = count
+
+        return {
+            "status_counts": status_counts,
+            "avg_duration_seconds": float(avg_duration)
+            if avg_duration is not None
+            else None,
+            "completed_last_24h": completed_last_24h,
+            "failed_last_24h": failed_last_24h,
+            "total_last_24h": total_last_24h,
+            "total": total,
+        }
+
 
 DTaskRepository = Annotated[TaskRepository, Depends(TaskRepository)]
