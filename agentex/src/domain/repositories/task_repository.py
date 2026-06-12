@@ -1,9 +1,10 @@
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 
 from fastapi import Depends
-from sqlalchemy import distinct, func, select, update
+from sqlalchemy import case, distinct, extract, func, select, update
 from sqlalchemy.orm import selectinload
 from src.adapters.crud_store.adapter_postgres import (
     ColumnPrimitiveValue,
@@ -246,6 +247,80 @@ class TaskRepository(PostgresCRUDRepository[TaskORM, TaskEntity, TaskRelationshi
             if refreshed is None:
                 return None
             return TaskEntity.model_validate(refreshed)
+
+    async def get_analytics_for_agent(self, agent_id: str) -> "AgentTaskAnalytics":
+        """Compute task analytics for a single agent in two efficient queries."""
+        now = datetime.now(UTC)
+        cutoff_24h = now - timedelta(hours=24)
+
+        # Query 1: status counts + average duration of completed tasks.
+        status_count_query = (
+            select(
+                TaskORM.status,
+                func.count().label("cnt"),
+                func.avg(
+                    case(
+                        (
+                            TaskORM.status == TaskStatus.COMPLETED,
+                            extract("epoch", TaskORM.updated_at - TaskORM.created_at),
+                        ),
+                    )
+                ).label("avg_dur"),
+            )
+            .join(TaskAgentORM, TaskORM.id == TaskAgentORM.task_id)
+            .where(
+                TaskAgentORM.agent_id == agent_id,
+                TaskORM.status != TaskStatus.DELETED,
+            )
+            .group_by(TaskORM.status)
+        )
+
+        # Query 2: 24h window counts for completed and failed tasks.
+        window_query = (
+            select(
+                func.count()
+                .filter(TaskORM.status == TaskStatus.COMPLETED)
+                .label("completed_24h"),
+                func.count()
+                .filter(TaskORM.status == TaskStatus.FAILED)
+                .label("failed_24h"),
+            )
+            .select_from(TaskORM)
+            .join(TaskAgentORM, TaskORM.id == TaskAgentORM.task_id)
+            .where(
+                TaskAgentORM.agent_id == agent_id,
+                TaskORM.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                TaskORM.updated_at >= cutoff_24h,
+            )
+        )
+
+        async with self.start_async_db_session(allow_writes=False) as session:
+            status_result = await session.execute(status_count_query)
+            window_result = await session.execute(window_query)
+
+        summary = AgentTaskAnalytics()
+        completed_avg_dur: float | None = None
+        for row in status_result.all():
+            status_val = row.status.value if row.status else "UNKNOWN"
+            summary.status_counts[status_val] = row.cnt
+            if row.status == TaskStatus.COMPLETED and row.avg_dur is not None:
+                completed_avg_dur = float(row.avg_dur)
+
+        summary.avg_duration_seconds = completed_avg_dur
+
+        window_row = window_result.one()
+        summary.completed_last_24h = window_row.completed_24h
+        summary.failed_last_24h = window_row.failed_24h
+
+        return summary
+
+
+@dataclass
+class AgentTaskAnalytics:
+    status_counts: dict[str, int] = field(default_factory=dict)
+    avg_duration_seconds: float | None = None
+    completed_last_24h: int = 0
+    failed_last_24h: int = 0
 
 
 DTaskRepository = Annotated[TaskRepository, Depends(TaskRepository)]
