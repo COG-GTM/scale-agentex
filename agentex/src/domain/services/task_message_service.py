@@ -239,9 +239,16 @@ class TaskMessageService:
         )
         if len(updated_messages) < len(to_update):
             updated_ids = {m.id for m in updated_messages}
-            missing_id = next(m.id for m in to_update if m.id not in updated_ids)
+            missing_id = next(
+                (m.id for m in to_update if m.id not in updated_ids),
+                to_update[len(updated_messages)].id,
+            )
         if missing_id is not None:
-            raise ItemDoesNotExist(f"Item with id '{missing_id}' does not exist.")
+            # Same message the per-item repository.get raised.
+            raise ItemDoesNotExist(
+                f"Item with {'id' if missing_id else 'name'} "
+                f"'{missing_id or None}' does not exist."
+            )
         return updated_messages
 
     async def delete_message(self, task_id: str, message_id: str) -> bool:

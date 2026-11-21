@@ -488,6 +488,9 @@ class MongoDBCRUDRepository(CRUDRepository[T], Generic[T]):
             ) from e
 
     @retry_write_operation()
+    async def _bulk_write(self, operations: list[UpdateOne]) -> None:
+        await self.collection.bulk_write(operations, ordered=True)
+
     async def batch_update(
         self, items: list[T], fields: list[str] | None = None
     ) -> list[T]:
@@ -550,7 +553,7 @@ class MongoDBCRUDRepository(CRUDRepository[T], Generic[T]):
                     raise encode_error
                 return updated_items
 
-            await self.collection.bulk_write(operations, ordered=True)
+            await self._bulk_write(operations)
             if encode_error is not None:
                 raise encode_error
 
@@ -563,13 +566,7 @@ class MongoDBCRUDRepository(CRUDRepository[T], Generic[T]):
                 for id_value in id_values
                 if id_value in by_id
             ]
-        except (
-            ClientError,
-            ServiceError,
-            pymongo.errors.AutoReconnect,
-            pymongo.errors.NetworkTimeout,
-            pymongo.errors.ServerSelectionTimeoutError,
-        ):
+        except (ClientError, ServiceError):
             raise
         except Exception as e:
             raise ServiceError(

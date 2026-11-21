@@ -503,22 +503,31 @@ class TestTaskMessageService:
             content=TextContent(content="Streaming", author=MessageAuthor.AGENT),
             streaming_status="IN_PROGRESS",
         )
-        stale = await task_message_repository.find_by_ids([first.id, streaming.id])
-        done = await task_message_service.get_message(streaming.id)
-        done.streaming_status = "DONE"
-        await task_message_repository.update(done)
+        find_by_ids = task_message_repository.find_by_ids
 
-        for message in stale.values():
-            message.content = TextContent(
-                content=f"Edited {message.id}", author=MessageAuthor.AGENT
-            )
-        await task_message_repository.batch_update(
-            list(stale.values()), fields=["content"]
+        async def find_then_finish_stream(ids):
+            snapshot = await find_by_ids(ids)
+            done = await task_message_service.get_message(streaming.id)
+            done.streaming_status = "DONE"
+            await task_message_repository.update(done)
+            return snapshot
+
+        task_message_repository.find_by_ids = find_then_finish_stream
+        await task_message_service.update_messages(
+            sample_task_id,
+            {
+                first.id: TextContent(
+                    content="Edited first", author=MessageAuthor.AGENT
+                ),
+                streaming.id: TextContent(
+                    content="Edited streaming", author=MessageAuthor.AGENT
+                ),
+            },
         )
 
         reloaded = await task_message_service.get_message(streaming.id)
         assert reloaded.streaming_status == "DONE"
-        assert reloaded.content.content == f"Edited {streaming.id}"
+        assert reloaded.content.content == "Edited streaming"
 
     async def test_update_messages_batch_unencodable_item_keeps_prior_updates(
         self, task_message_service, sample_task_id
