@@ -503,16 +503,16 @@ class TestTaskMessageService:
             content=TextContent(content="Streaming", author=MessageAuthor.AGENT),
             streaming_status="IN_PROGRESS",
         )
-        find_by_ids = task_message_repository.find_by_ids
+        find_field_by_ids = task_message_repository.find_field_by_ids
 
-        async def find_then_finish_stream(ids):
-            snapshot = await find_by_ids(ids)
+        async def find_then_finish_stream(ids, field_name):
+            snapshot = await find_field_by_ids(ids, field_name)
             done = await task_message_service.get_message(streaming.id)
             done.streaming_status = "DONE"
             await task_message_repository.update(done)
             return snapshot
 
-        task_message_repository.find_by_ids = find_then_finish_stream
+        task_message_repository.find_field_by_ids = find_then_finish_stream
         await task_message_service.update_messages(
             sample_task_id,
             {

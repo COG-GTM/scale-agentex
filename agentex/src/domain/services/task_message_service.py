@@ -219,29 +219,28 @@ class TaskMessageService:
         if not updates:
             return []
 
-        existing = await self.repository.find_by_ids(list(updates))
+        task_ids = await self.repository.find_field_by_ids(list(updates), "task_id")
         to_update = []
         missing_id = None
         for message_id, message in updates.items():
-            task_message = existing.get(message_id)
-            if task_message is None:
+            if message_id not in task_ids:
                 missing_id = message_id
                 break
-            if task_message.task_id == task_id:
-                # Update the message field but preserve other fields
-                task_message.content = message
-                to_update.append(task_message)
+            if task_ids[message_id] == task_id:
+                to_update.append({"id": message_id, "content": message.model_dump()})
 
         updated_messages = (
-            await self.repository.batch_update(to_update, fields=["content"])
+            await self.repository.batch_update(
+                to_update, fields=["content"], match={"task_id": task_id}
+            )
             if to_update
             else []
         )
         if len(updated_messages) < len(to_update):
             updated_ids = {m.id for m in updated_messages}
             missing_id = next(
-                (m.id for m in to_update if m.id not in updated_ids),
-                to_update[len(updated_messages)].id,
+                (m["id"] for m in to_update if m["id"] not in updated_ids),
+                to_update[len(updated_messages)]["id"],
             )
         if missing_id is not None:
             # Same message the per-item repository.get raised.

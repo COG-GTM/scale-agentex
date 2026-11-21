@@ -462,110 +462,135 @@ class MongoDBCRUDRepository(CRUDRepository[T], Generic[T]):
                 message=f"Failed to update item in MongoDB: {e}", detail=str(e)
             ) from e
 
-    async def find_by_ids(self, ids: list[str]) -> dict[str, T]:
+    @staticmethod
+    def _id_values(ids: list[str]) -> dict[str, Any]:
+        return {_id: ObjectId(_id) if ObjectId.is_valid(_id) else _id for _id in ids}
+
+    @retry_write_operation()
+    async def _find_many(
+        self, query: dict[str, Any], projection: dict[str, Any] | None = None
+    ) -> builtins.list[dict[str, Any]]:
+        return await self.collection.find(query, projection).to_list(length=None)
+
+    async def find_field_by_ids(
+        self, ids: list[str], field_name: str
+    ) -> dict[str, Any]:
         """
-        Retrieve documents by ID in one query, keyed by the requested ID.
-        IDs with no matching document are absent from the result.
+        Retrieve one field of the documents with the given IDs in one query,
+        keyed by the requested ID. IDs with no matching document are absent.
         """
         if not ids:
             return {}
         try:
-            id_values = {
-                _id: ObjectId(_id) if ObjectId.is_valid(_id) else _id for _id in ids
+            id_values = self._id_values(ids)
+            documents = await self._find_many(
+                {"_id": {"$in": list(id_values.values())}}, {field_name: 1}
+            )
+            by_id = {
+                document["_id"]: document.get(field_name) for document in documents
             }
-            documents = await self.collection.find(
-                {"_id": {"$in": list(id_values.values())}}
-            ).to_list(length=None)
-            by_id = {document["_id"]: document for document in documents}
             return {
-                _id: self._deserialize(dict(by_id[id_value]))
+                _id: by_id[id_value]
                 for _id, id_value in id_values.items()
                 if id_value in by_id
             }
+        except ServiceError:
+            raise
         except Exception as e:
             raise ServiceError(
                 message=f"Failed to find items by ids in MongoDB: {e}", detail=str(e)
             ) from e
 
     @retry_write_operation()
-    async def _bulk_write(self, operations: list[UpdateOne]) -> None:
+    async def _bulk_set(
+        self, filters: builtins.list[dict], updates: builtins.list[dict]
+    ) -> None:
+        operations = [
+            UpdateOne(f, {"$set": {**u, "updated_at": datetime.now(UTC)}})
+            for f, u in zip(filters, updates, strict=True)
+        ]
         await self.collection.bulk_write(operations, ordered=True)
 
+    @retry_write_operation()
+    async def _set_one(self, filter: dict, update: dict) -> dict | None:
+        result = await self.collection.update_one(
+            filter, {"$set": {**update, "updated_at": datetime.now(UTC)}}
+        )
+        if not result.matched_count:
+            return None
+        return await self.collection.find_one(filter)
+
     async def batch_update(
-        self, items: list[T], fields: list[str] | None = None
+        self,
+        items: list[T | dict[str, Any]],
+        fields: list[str] | None = None,
+        match: dict[str, Any] | None = None,
     ) -> list[T]:
         """
         Update multiple documents in one bulk write and one read-back.
         Maps .id to _id for each item when querying MongoDB.
-        Items whose document does not exist are skipped.
-        Returns the updated items in input order.
-        When `fields` is given, only those fields (and updated_at) are written.
+        When `fields` is given, only those fields (and updated_at) are written;
+        `match` adds conditions every updated document must also satisfy.
+        Items whose document does not exist (or does not match) are skipped.
         If an item cannot be encoded, the items before it are still written.
+        Returns the updated items in input order.
         """
         if not items:
             return []
         try:
-            operations = []
-            id_values = []
+            filters = []
+            updates = []
+            encode_error = None
             for item in items:
                 data = self._serialize(item)
                 id_value = data.get("_id")
                 if id_value is None:
                     raise ClientError("Item must have an ID for update.")
                 update_data = {
-                    k: v for k, v in data.items() if k not in ("_id", "created_at")
+                    k: v
+                    for k, v in data.items()
+                    if k not in ("_id", "created_at")
+                    and (fields is None or k in fields)
                 }
-                if fields is not None:
-                    update_data = {k: v for k, v in update_data.items() if k in fields}
-                update_data["updated_at"] = datetime.now(UTC)
-                operations.append(UpdateOne({"_id": id_value}, {"$set": update_data}))
-                id_values.append(id_value)
-
-            encode_error = None
-            for index, operation in enumerate(operations):
                 try:
                     bson.encode(
-                        operation._doc, codec_options=self.collection.codec_options
+                        {"$set": update_data},
+                        codec_options=self.collection.codec_options,
                     )
                 except Exception as e:
                     encode_error = e
-                    operations = operations[:index]
-                    id_values = id_values[:index]
-                    items = items[:index]
                     break
+                filters.append({"_id": id_value, **(match or {})})
+                updates.append(update_data)
 
-            if encode_error is not None and not operations:
-                raise encode_error
-            if (encode_error is None and len(items) == 1) or len(set(id_values)) != len(
-                id_values
-            ):
+            id_values = [f["_id"] for f in filters]
+            if (encode_error is None and len(filters) == 1) or len(
+                set(id_values)
+            ) != len(id_values):
                 # One item gains nothing from a bulk write, and repeated IDs
                 # must observe each other's writes in order.
                 updated_items = []
-                for operation in operations:
-                    result = await self.collection.update_one(
-                        operation._filter, operation._doc
-                    )
-                    if result.matched_count:
-                        document = await self.collection.find_one(operation._filter)
+                for filter, update in zip(filters, updates, strict=True):
+                    document = await self._set_one(filter, update)
+                    if document is not None:
                         updated_items.append(self._deserialize(document))
-                if encode_error is not None:
-                    raise encode_error
-                return updated_items
+            elif filters:
+                await self._bulk_set(filters, updates)
+                documents = await self._find_many(
+                    {"_id": {"$in": id_values}, **(match or {})}
+                )
+                by_id = {document["_id"]: document for document in documents}
+                updated_items = [
+                    self._deserialize(by_id[id_value])
+                    for id_value in id_values
+                    if id_value in by_id
+                ]
+            else:
+                updated_items = []
 
-            await self._bulk_write(operations)
             if encode_error is not None:
                 raise encode_error
-
-            documents = await self.collection.find({"_id": {"$in": id_values}}).to_list(
-                length=None
-            )
-            by_id = {document["_id"]: document for document in documents}
-            return [
-                self._deserialize(by_id[id_value])
-                for id_value in id_values
-                if id_value in by_id
-            ]
+            return updated_items
         except (ClientError, ServiceError):
             raise
         except Exception as e:
