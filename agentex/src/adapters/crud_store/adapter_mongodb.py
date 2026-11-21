@@ -7,6 +7,7 @@ from typing import Any, Generic, TypeVar
 
 import pymongo
 from bson import ObjectId
+from pymongo import UpdateOne
 from pymongo.asynchronous.collection import AsyncCollection
 
 from src.adapters.crud_store.exceptions import DuplicateItemError, ItemDoesNotExist
@@ -460,20 +461,82 @@ class MongoDBCRUDRepository(CRUDRepository[T], Generic[T]):
                 message=f"Failed to update item in MongoDB: {e}", detail=str(e)
             ) from e
 
+    async def find_by_ids(self, ids: list[str]) -> dict[str, T]:
+        """
+        Retrieve documents by ID in one query, keyed by the requested ID.
+        IDs with no matching document are absent from the result.
+        """
+        if not ids:
+            return {}
+        try:
+            id_values = {_id: self._convert_id(_id) for _id in ids}
+            documents = await self.collection.find(
+                {"_id": {"$in": list(id_values.values())}}
+            ).to_list(length=None)
+            by_id = {document["_id"]: document for document in documents}
+            return {
+                _id: self._deserialize(dict(by_id[id_value]))
+                for _id, id_value in id_values.items()
+                if id_value in by_id
+            }
+        except Exception as e:
+            raise ServiceError(
+                message=f"Failed to find items by ids in MongoDB: {e}", detail=str(e)
+            ) from e
+
+    @retry_write_operation()
     async def batch_update(self, items: list[T]) -> list[T]:
         """
-        Update multiple documents.
+        Update multiple documents in one bulk write and one read-back.
         Maps .id to _id for each item when querying MongoDB.
+        Items whose document does not exist are skipped.
+        Returns the updated items in input order.
         """
-        updated_items = []
-        for item in items:
-            try:
-                updated_item = await self.update(item)
-                if updated_item:
-                    updated_items.append(updated_item)
-            except ItemDoesNotExist:
-                continue
-        return updated_items
+        if not items:
+            return []
+        try:
+            operations = []
+            id_values = []
+            for item in items:
+                data = self._serialize(item)
+                id_value = data.get("_id")
+                if id_value is None:
+                    raise ClientError("Item must have an ID for update.")
+                update_data = {
+                    k: v for k, v in data.items() if k not in ("_id", "created_at")
+                }
+                update_data["updated_at"] = datetime.now(UTC)
+                operations.append(UpdateOne({"_id": id_value}, {"$set": update_data}))
+                id_values.append(id_value)
+
+            if len(items) == 1 or len(set(id_values)) != len(id_values):
+                # One item gains nothing from a bulk write, and repeated IDs
+                # must observe each other's writes in order.
+                updated_items = []
+                for item in items:
+                    try:
+                        updated_items.append(await self.update(item))
+                    except ItemDoesNotExist:
+                        continue
+                return updated_items
+
+            await self.collection.bulk_write(operations, ordered=True)
+
+            documents = await self.collection.find({"_id": {"$in": id_values}}).to_list(
+                length=None
+            )
+            by_id = {document["_id"]: document for document in documents}
+            return [
+                self._deserialize(by_id[id_value])
+                for id_value in id_values
+                if id_value in by_id
+            ]
+        except (ClientError, ServiceError):
+            raise
+        except Exception as e:
+            raise ServiceError(
+                message=f"Failed to batch update items in MongoDB: {e}", detail=str(e)
+            ) from e
 
     @retry_write_operation()
     async def delete(self, id: str | None = None, name: str | None = None) -> None:

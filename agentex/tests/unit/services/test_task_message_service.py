@@ -424,6 +424,71 @@ class TestTaskMessageService:
                 assert updated_message.content.content == "Updated message 2"
                 assert updated_message.content.author == MessageAuthor.USER
 
+    async def test_update_messages_batch_preserves_order_and_skips_other_tasks(
+        self, task_message_service, sample_task_id
+    ):
+        """Batch updates return in request order and leave other tasks' messages"""
+        messages = [
+            await task_message_service.append_message(
+                task_id=sample_task_id,
+                content=TextContent(content=f"Original {i}", author=MessageAuthor.USER),
+            )
+            for i in range(3)
+        ]
+        other = await task_message_service.append_message(
+            task_id=f"{sample_task_id}-other",
+            content=TextContent(content="Other task", author=MessageAuthor.USER),
+        )
+
+        updates = {
+            messages[2].id: TextContent(
+                content="Updated 2", author=MessageAuthor.AGENT
+            ),
+            other.id: TextContent(content="Hijacked", author=MessageAuthor.AGENT),
+            messages[0].id: TextContent(
+                content="Updated 0", author=MessageAuthor.AGENT
+            ),
+        }
+
+        result = await task_message_service.update_messages(sample_task_id, updates)
+
+        assert [m.id for m in result] == [messages[2].id, messages[0].id]
+        assert [m.content.content for m in result] == ["Updated 2", "Updated 0"]
+        unchanged_other = await task_message_service.get_message(other.id)
+        assert unchanged_other.content.content == "Other task"
+        unchanged = await task_message_service.get_message(messages[1].id)
+        assert unchanged.content.content == "Original 1"
+
+    async def test_update_messages_batch_missing_id_raises_after_prior_updates(
+        self, task_message_service, sample_task_id
+    ):
+        """A missing ID raises, keeping updates listed before it and skipping later ones"""
+        first = await task_message_service.append_message(
+            task_id=sample_task_id,
+            content=TextContent(content="First", author=MessageAuthor.USER),
+        )
+        last = await task_message_service.append_message(
+            task_id=sample_task_id,
+            content=TextContent(content="Last", author=MessageAuthor.USER),
+        )
+        missing_id = "0123456789abcdef01234567"
+
+        updates = {
+            first.id: TextContent(content="First updated", author=MessageAuthor.AGENT),
+            missing_id: TextContent(content="Missing", author=MessageAuthor.AGENT),
+            last.id: TextContent(content="Last updated", author=MessageAuthor.AGENT),
+        }
+
+        with pytest.raises(ItemDoesNotExist, match=missing_id):
+            await task_message_service.update_messages(sample_task_id, updates)
+
+        assert (
+            await task_message_service.get_message(first.id)
+        ).content.content == "First updated"
+        assert (
+            await task_message_service.get_message(last.id)
+        ).content.content == "Last"
+
     async def test_delete_message_success(
         self, task_message_service, sample_task_id, sample_message_content
     ):
