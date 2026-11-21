@@ -483,12 +483,23 @@ class MongoDBCRUDRepository(CRUDRepository[T], Generic[T]):
             return {}
         try:
             id_values = self._id_values(ids)
-            documents = await self._find_many(
-                {"_id": {"$in": list(id_values.values())}}, {field_name: 1}
-            )
-            by_id = {
-                document["_id"]: document.get(field_name) for document in documents
-            }
+            by_id = {}
+            # Chunk the $in list so a batch of long IDs stays far below the
+            # BSON document size limit.
+            chunk, chunk_bytes = [], 0
+            values = list(id_values.values())
+            for index, id_value in enumerate(values):
+                chunk.append(id_value)
+                chunk_bytes += len(str(id_value)) + 16
+                if chunk_bytes >= 1_000_000 or index == len(values) - 1:
+                    documents = await self._find_many(
+                        {"_id": {"$in": chunk}}, {field_name: 1}
+                    )
+                    by_id.update(
+                        (document["_id"], document.get(field_name))
+                        for document in documents
+                    )
+                    chunk, chunk_bytes = [], 0
             return {
                 _id: by_id[id_value]
                 for _id, id_value in id_values.items()
@@ -576,6 +587,8 @@ class MongoDBCRUDRepository(CRUDRepository[T], Generic[T]):
                         updated_items.append(self._deserialize(document))
             elif filters:
                 await self._bulk_set(filters, updates)
+                if encode_error is not None:
+                    raise encode_error
                 documents = await self._find_many(
                     {"_id": {"$in": id_values}, **(match or {})}
                 )
