@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from functools import wraps
 from typing import Any, Generic, TypeVar
 
+import bson
 import pymongo
 from bson import ObjectId
 from pymongo import UpdateOne
@@ -469,7 +470,9 @@ class MongoDBCRUDRepository(CRUDRepository[T], Generic[T]):
         if not ids:
             return {}
         try:
-            id_values = {_id: self._convert_id(_id) for _id in ids}
+            id_values = {
+                _id: ObjectId(_id) if ObjectId.is_valid(_id) else _id for _id in ids
+            }
             documents = await self.collection.find(
                 {"_id": {"$in": list(id_values.values())}}
             ).to_list(length=None)
@@ -485,12 +488,16 @@ class MongoDBCRUDRepository(CRUDRepository[T], Generic[T]):
             ) from e
 
     @retry_write_operation()
-    async def batch_update(self, items: list[T]) -> list[T]:
+    async def batch_update(
+        self, items: list[T], fields: list[str] | None = None
+    ) -> list[T]:
         """
         Update multiple documents in one bulk write and one read-back.
         Maps .id to _id for each item when querying MongoDB.
         Items whose document does not exist are skipped.
         Returns the updated items in input order.
+        When `fields` is given, only those fields (and updated_at) are written.
+        If an item cannot be encoded, the items before it are still written.
         """
         if not items:
             return []
@@ -505,22 +512,47 @@ class MongoDBCRUDRepository(CRUDRepository[T], Generic[T]):
                 update_data = {
                     k: v for k, v in data.items() if k not in ("_id", "created_at")
                 }
+                if fields is not None:
+                    update_data = {k: v for k, v in update_data.items() if k in fields}
                 update_data["updated_at"] = datetime.now(UTC)
                 operations.append(UpdateOne({"_id": id_value}, {"$set": update_data}))
                 id_values.append(id_value)
 
-            if len(items) == 1 or len(set(id_values)) != len(id_values):
+            encode_error = None
+            for index, operation in enumerate(operations):
+                try:
+                    bson.encode(
+                        operation._doc, codec_options=self.collection.codec_options
+                    )
+                except Exception as e:
+                    encode_error = e
+                    operations = operations[:index]
+                    id_values = id_values[:index]
+                    items = items[:index]
+                    break
+
+            if encode_error is not None and not operations:
+                raise encode_error
+            if (encode_error is None and len(items) == 1) or len(set(id_values)) != len(
+                id_values
+            ):
                 # One item gains nothing from a bulk write, and repeated IDs
                 # must observe each other's writes in order.
                 updated_items = []
-                for item in items:
-                    try:
-                        updated_items.append(await self.update(item))
-                    except ItemDoesNotExist:
-                        continue
+                for operation in operations:
+                    result = await self.collection.update_one(
+                        operation._filter, operation._doc
+                    )
+                    if result.matched_count:
+                        document = await self.collection.find_one(operation._filter)
+                        updated_items.append(self._deserialize(document))
+                if encode_error is not None:
+                    raise encode_error
                 return updated_items
 
             await self.collection.bulk_write(operations, ordered=True)
+            if encode_error is not None:
+                raise encode_error
 
             documents = await self.collection.find({"_id": {"$in": id_values}}).to_list(
                 length=None
@@ -531,11 +563,17 @@ class MongoDBCRUDRepository(CRUDRepository[T], Generic[T]):
                 for id_value in id_values
                 if id_value in by_id
             ]
-        except (ClientError, ServiceError):
+        except (
+            ClientError,
+            ServiceError,
+            pymongo.errors.AutoReconnect,
+            pymongo.errors.NetworkTimeout,
+            pymongo.errors.ServerSelectionTimeoutError,
+        ):
             raise
         except Exception as e:
             raise ServiceError(
-                message=f"Failed to batch update items in MongoDB: {e}", detail=str(e)
+                message=f"Failed to update item in MongoDB: {e}", detail=str(e)
             ) from e
 
     @retry_write_operation()

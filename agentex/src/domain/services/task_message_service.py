@@ -233,8 +233,13 @@ class TaskMessageService:
                 to_update.append(task_message)
 
         updated_messages = (
-            await self.repository.batch_update(to_update) if to_update else []
+            await self.repository.batch_update(to_update, fields=["content"])
+            if to_update
+            else []
         )
+        if len(updated_messages) < len(to_update):
+            updated_ids = {m.id for m in updated_messages}
+            missing_id = next(m.id for m in to_update if m.id not in updated_ids)
         if missing_id is not None:
             raise ItemDoesNotExist(f"Item with id '{missing_id}' does not exist.")
         return updated_messages
