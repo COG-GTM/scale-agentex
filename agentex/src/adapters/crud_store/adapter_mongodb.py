@@ -5,8 +5,10 @@ from datetime import UTC, datetime
 from functools import wraps
 from typing import Any, Generic, TypeVar
 
+import bson
 import pymongo
 from bson import ObjectId
+from pymongo import UpdateOne
 from pymongo.asynchronous.collection import AsyncCollection
 
 from src.adapters.crud_store.exceptions import DuplicateItemError, ItemDoesNotExist
@@ -460,20 +462,154 @@ class MongoDBCRUDRepository(CRUDRepository[T], Generic[T]):
                 message=f"Failed to update item in MongoDB: {e}", detail=str(e)
             ) from e
 
-    async def batch_update(self, items: list[T]) -> list[T]:
+    @staticmethod
+    def _id_values(ids: list[str]) -> dict[str, Any]:
+        return {_id: ObjectId(_id) if ObjectId.is_valid(_id) else _id for _id in ids}
+
+    @retry_write_operation()
+    async def _find_many(
+        self, query: dict[str, Any], projection: dict[str, Any] | None = None
+    ) -> builtins.list[dict[str, Any]]:
+        return await self.collection.find(query, projection).to_list(length=None)
+
+    async def find_field_by_ids(
+        self, ids: list[str], field_name: str
+    ) -> dict[str, Any]:
         """
-        Update multiple documents.
+        Retrieve one field of the documents with the given IDs in one query,
+        keyed by the requested ID. IDs with no matching document are absent.
+        """
+        if not ids:
+            return {}
+        try:
+            id_values = self._id_values(ids)
+            by_id = {}
+            # Chunk the $in list so a batch of long IDs stays far below the
+            # BSON document size limit.
+            chunk, chunk_bytes = [], 0
+            values = list(id_values.values())
+            for index, id_value in enumerate(values):
+                chunk.append(id_value)
+                chunk_bytes += len(str(id_value)) + 16
+                if chunk_bytes >= 1_000_000 or index == len(values) - 1:
+                    documents = await self._find_many(
+                        {"_id": {"$in": chunk}}, {field_name: 1}
+                    )
+                    by_id.update(
+                        (document["_id"], document.get(field_name))
+                        for document in documents
+                    )
+                    chunk, chunk_bytes = [], 0
+            return {
+                _id: by_id[id_value]
+                for _id, id_value in id_values.items()
+                if id_value in by_id
+            }
+        except ServiceError:
+            raise
+        except Exception as e:
+            raise ServiceError(
+                message=f"Failed to find items by ids in MongoDB: {e}", detail=str(e)
+            ) from e
+
+    @retry_write_operation()
+    async def _bulk_set(
+        self, filters: builtins.list[dict], updates: builtins.list[dict]
+    ) -> None:
+        operations = [
+            UpdateOne(f, {"$set": {**u, "updated_at": datetime.now(UTC)}})
+            for f, u in zip(filters, updates, strict=True)
+        ]
+        await self.collection.bulk_write(operations, ordered=True)
+
+    @retry_write_operation()
+    async def _set_one(self, filter: dict, update: dict) -> dict | None:
+        result = await self.collection.update_one(
+            filter, {"$set": {**update, "updated_at": datetime.now(UTC)}}
+        )
+        if not result.matched_count:
+            return None
+        return await self.collection.find_one(filter)
+
+    async def batch_update(
+        self,
+        items: list[T | dict[str, Any]],
+        fields: list[str] | None = None,
+        match: dict[str, Any] | None = None,
+    ) -> list[T]:
+        """
+        Update multiple documents in one bulk write and one read-back.
         Maps .id to _id for each item when querying MongoDB.
+        When `fields` is given, only those fields (and updated_at) are written;
+        `match` adds conditions every updated document must also satisfy.
+        Items whose document does not exist (or does not match) are skipped.
+        If an item cannot be encoded, the items before it are still written.
+        Returns the updated items in input order.
         """
-        updated_items = []
-        for item in items:
-            try:
-                updated_item = await self.update(item)
-                if updated_item:
-                    updated_items.append(updated_item)
-            except ItemDoesNotExist:
-                continue
-        return updated_items
+        if not items:
+            return []
+        try:
+            filters = []
+            updates = []
+            encode_error = None
+            for item in items:
+                data = self._serialize(item)
+                id_value = data.get("_id")
+                if id_value is None:
+                    raise ClientError("Item must have an ID for update.")
+                update_data = {
+                    k: v
+                    for k, v in data.items()
+                    if k not in ("_id", "created_at")
+                    and (fields is None or k in fields)
+                }
+                try:
+                    bson.encode(
+                        {"$set": update_data},
+                        codec_options=self.collection.codec_options,
+                    )
+                except Exception as e:
+                    encode_error = e
+                    break
+                filters.append({"_id": id_value, **(match or {})})
+                updates.append(update_data)
+
+            id_values = [f["_id"] for f in filters]
+            if (encode_error is None and len(filters) == 1) or len(
+                set(id_values)
+            ) != len(id_values):
+                # One item gains nothing from a bulk write, and repeated IDs
+                # must observe each other's writes in order.
+                updated_items = []
+                for filter, update in zip(filters, updates, strict=True):
+                    document = await self._set_one(filter, update)
+                    if document is not None:
+                        updated_items.append(self._deserialize(document))
+            elif filters:
+                await self._bulk_set(filters, updates)
+                if encode_error is not None:
+                    raise encode_error
+                documents = await self._find_many(
+                    {"_id": {"$in": id_values}, **(match or {})}
+                )
+                by_id = {document["_id"]: document for document in documents}
+                updated_items = [
+                    self._deserialize(by_id[id_value])
+                    for id_value in id_values
+                    if id_value in by_id
+                ]
+            else:
+                updated_items = []
+
+            if encode_error is not None:
+                raise encode_error
+            return updated_items
+        except (ClientError, ServiceError):
+            raise
+        except Exception as e:
+            raise ServiceError(
+                message=f"Failed to update item in MongoDB: {e}", detail=str(e)
+            ) from e
 
     @retry_write_operation()
     async def delete(self, id: str | None = None, name: str | None = None) -> None:

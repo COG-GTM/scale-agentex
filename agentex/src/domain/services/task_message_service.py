@@ -3,6 +3,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import Depends
 
+from src.adapters.crud_store.exceptions import ItemDoesNotExist
 from src.domain.entities.task_messages import (
     TaskMessageContentEntity,
     TaskMessageEntity,
@@ -215,15 +216,38 @@ class TaskMessageService:
         Returns:
             List of updated TaskMessageEntity objects
         """
-        updated_messages = []
-        for message_id, message in updates.items():
-            # Get the existing task message
-            task_message = await self.repository.get(id=message_id)
-            if task_message and task_message.task_id == task_id:
-                # Update the message field but preserve other fields
-                task_message.content = message
-                updated_messages.append(await self.repository.update(task_message))
+        if not updates:
+            return []
 
+        task_ids = await self.repository.find_field_by_ids(list(updates), "task_id")
+        to_update = []
+        missing_id = None
+        for message_id, message in updates.items():
+            if message_id not in task_ids:
+                missing_id = message_id
+                break
+            if task_ids[message_id] == task_id:
+                to_update.append({"id": message_id, "content": message.model_dump()})
+
+        updated_messages = (
+            await self.repository.batch_update(
+                to_update, fields=["content"], match={"task_id": task_id}
+            )
+            if to_update
+            else []
+        )
+        if len(updated_messages) < len(to_update):
+            updated_ids = {m.id for m in updated_messages}
+            missing_id = next(
+                (m["id"] for m in to_update if m["id"] not in updated_ids),
+                to_update[len(updated_messages)]["id"],
+            )
+        if missing_id is not None:
+            # Same message the per-item repository.get raised.
+            raise ItemDoesNotExist(
+                f"Item with {'id' if missing_id else 'name'} "
+                f"'{missing_id or None}' does not exist."
+            )
         return updated_messages
 
     async def delete_message(self, task_id: str, message_id: str) -> bool:

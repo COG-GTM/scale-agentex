@@ -4,8 +4,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from src.adapters.crud_store.exceptions import ItemDoesNotExist
-from src.api.schemas.task_messages import TextContent
+from src.api.schemas.task_messages import DataContent, TextContent
 from src.domain.entities.task_messages import MessageAuthor, TaskMessageEntity
+from src.domain.exceptions import ServiceError
 from src.domain.repositories.task_message_repository import TaskMessageRepository
 from src.domain.services.task_message_service import TaskMessageService
 
@@ -423,6 +424,140 @@ class TestTaskMessageService:
             elif updated_message.id == message2.id:
                 assert updated_message.content.content == "Updated message 2"
                 assert updated_message.content.author == MessageAuthor.USER
+
+    async def test_update_messages_batch_preserves_order_and_skips_other_tasks(
+        self, task_message_service, sample_task_id
+    ):
+        """Batch updates return in request order and leave other tasks' messages"""
+        messages = [
+            await task_message_service.append_message(
+                task_id=sample_task_id,
+                content=TextContent(content=f"Original {i}", author=MessageAuthor.USER),
+            )
+            for i in range(3)
+        ]
+        other = await task_message_service.append_message(
+            task_id=f"{sample_task_id}-other",
+            content=TextContent(content="Other task", author=MessageAuthor.USER),
+        )
+
+        updates = {
+            messages[2].id: TextContent(
+                content="Updated 2", author=MessageAuthor.AGENT
+            ),
+            other.id: TextContent(content="Hijacked", author=MessageAuthor.AGENT),
+            messages[0].id: TextContent(
+                content="Updated 0", author=MessageAuthor.AGENT
+            ),
+        }
+
+        result = await task_message_service.update_messages(sample_task_id, updates)
+
+        assert [m.id for m in result] == [messages[2].id, messages[0].id]
+        assert [m.content.content for m in result] == ["Updated 2", "Updated 0"]
+        unchanged_other = await task_message_service.get_message(other.id)
+        assert unchanged_other.content.content == "Other task"
+        unchanged = await task_message_service.get_message(messages[1].id)
+        assert unchanged.content.content == "Original 1"
+
+    async def test_update_messages_batch_missing_id_raises_after_prior_updates(
+        self, task_message_service, sample_task_id
+    ):
+        """A missing ID raises, keeping updates listed before it and skipping later ones"""
+        first = await task_message_service.append_message(
+            task_id=sample_task_id,
+            content=TextContent(content="First", author=MessageAuthor.USER),
+        )
+        last = await task_message_service.append_message(
+            task_id=sample_task_id,
+            content=TextContent(content="Last", author=MessageAuthor.USER),
+        )
+        missing_id = "0123456789abcdef01234567"
+
+        updates = {
+            first.id: TextContent(content="First updated", author=MessageAuthor.AGENT),
+            missing_id: TextContent(content="Missing", author=MessageAuthor.AGENT),
+            last.id: TextContent(content="Last updated", author=MessageAuthor.AGENT),
+        }
+
+        with pytest.raises(ItemDoesNotExist, match=missing_id):
+            await task_message_service.update_messages(sample_task_id, updates)
+
+        assert (
+            await task_message_service.get_message(first.id)
+        ).content.content == "First updated"
+        assert (
+            await task_message_service.get_message(last.id)
+        ).content.content == "Last"
+
+    async def test_update_messages_batch_does_not_revert_streaming_status(
+        self, task_message_service, task_message_repository, sample_task_id
+    ):
+        """A batch content edit keeps a streaming status written after the read"""
+        first = await task_message_service.append_message(
+            task_id=sample_task_id,
+            content=TextContent(content="First", author=MessageAuthor.USER),
+        )
+        streaming = await task_message_service.append_message(
+            task_id=sample_task_id,
+            content=TextContent(content="Streaming", author=MessageAuthor.AGENT),
+            streaming_status="IN_PROGRESS",
+        )
+        find_field_by_ids = task_message_repository.find_field_by_ids
+
+        async def find_then_finish_stream(ids, field_name):
+            snapshot = await find_field_by_ids(ids, field_name)
+            done = await task_message_service.get_message(streaming.id)
+            done.streaming_status = "DONE"
+            await task_message_repository.update(done)
+            return snapshot
+
+        task_message_repository.find_field_by_ids = find_then_finish_stream
+        await task_message_service.update_messages(
+            sample_task_id,
+            {
+                first.id: TextContent(
+                    content="Edited first", author=MessageAuthor.AGENT
+                ),
+                streaming.id: TextContent(
+                    content="Edited streaming", author=MessageAuthor.AGENT
+                ),
+            },
+        )
+
+        reloaded = await task_message_service.get_message(streaming.id)
+        assert reloaded.streaming_status == "DONE"
+        assert reloaded.content.content == "Edited streaming"
+
+    async def test_update_messages_batch_unencodable_item_keeps_prior_updates(
+        self, task_message_service, sample_task_id
+    ):
+        """An item BSON cannot encode fails the request after earlier items are saved"""
+        first = await task_message_service.append_message(
+            task_id=sample_task_id,
+            content=TextContent(content="First", author=MessageAuthor.USER),
+        )
+        second = await task_message_service.append_message(
+            task_id=sample_task_id,
+            content=TextContent(content="Second", author=MessageAuthor.USER),
+        )
+
+        updates = {
+            first.id: TextContent(content="Reviewed", author=MessageAuthor.AGENT),
+            second.id: DataContent(
+                data={"record_id": 2**63}, author=MessageAuthor.AGENT
+            ),
+        }
+
+        with pytest.raises(ServiceError):
+            await task_message_service.update_messages(sample_task_id, updates)
+
+        assert (
+            await task_message_service.get_message(first.id)
+        ).content.content == "Reviewed"
+        assert (
+            await task_message_service.get_message(second.id)
+        ).content.content == "Second"
 
     async def test_delete_message_success(
         self, task_message_service, sample_task_id, sample_message_content
